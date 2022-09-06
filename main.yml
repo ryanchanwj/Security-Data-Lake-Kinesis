@@ -1,0 +1,304 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Security Data Lake PoC using Kinesis
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: 
+          default: Kinesis
+        Parameters: 
+          - KinesisRawStreamName
+          - KinesisCuratedStreamName
+          - KinesisAnalyticsApplicationName
+          - KinesisFirehoseName
+      - Label: 
+          default: Glue
+        Parameters: 
+          - GlueDatabaseName
+          - GlueTableName
+      - Label: 
+          default: Athena 
+        Parameters: 
+          - AthenaWorkgroupName 
+      
+Parameters:
+  # Athena
+  AthenaWorkgroupName: 
+    Default: "test"
+    Description: "The name of the Athena Workgroup."
+    Type: String
+  # Glue
+  GlueDatabaseName: 
+    Default: "default"
+    Description: "The name of the Glue database."
+    Type: String
+  GlueTableName: 
+    Default: "curated_logs_analysis"
+    Description: "The name of the Glue table for curated logs."
+    Type: String
+  # Kinesis
+  KinesisAnalyticsApplicationName:
+    Default: "test-analytics"
+    Description: "The name of the Kinesis Data Analytics Studio notebook."
+    Type: String
+  KinesisFirehoseName: 
+    Default: "test-firehose"
+    Description: "The name of the Kinesis Firehose delivery stream."
+    Type: String
+  KinesisRawStreamName:
+    Default: "test-input"
+    Description: "The name of the Kinesis data stream for raw logs."
+    Type: String
+  KinesisCuratedStreamName:
+    Default: "test-output"
+    Description: "The name of the Kinesis data stream for curated logs."
+    Type: String
+
+Resources:
+  ## Kinesis Data Streams
+  InputStream: 
+    Type: AWS::Kinesis::Stream
+    Properties: 
+      Name: !Ref KinesisRawStreamName
+      RetentionPeriodHours: 24
+      ShardCount: 1
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+  OutputStream: 
+    Type: AWS::Kinesis::Stream
+    Properties: 
+      Name: !Ref KinesisCuratedStreamName
+      RetentionPeriodHours: 24
+      ShardCount: 1
+      StreamModeDetails: 
+        StreamMode: PROVISIONED
+  
+  ## Kinesis Data Analytics Studio Notebook
+  AnalyticsApplication:
+    Type: AWS::KinesisAnalyticsV2::Application
+    DependsOn:
+      - AnalyticsServiceExecutionRole
+    Properties: 
+      ApplicationMode: INTERACTIVE
+      ApplicationName: !Ref KinesisAnalyticsApplicationName
+      RuntimeEnvironment: ZEPPELIN-FLINK-2_0
+      ServiceExecutionRole: !GetAtt AnalyticsServiceExecutionRole.Arn
+      ApplicationConfiguration:
+        FlinkApplicationConfiguration:
+          ParallelismConfiguration:
+            Parallelism: 4
+            ParallelismPerKPU: 1
+            ConfigurationType: CUSTOM
+        ZeppelinApplicationConfiguration:
+          CustomArtifactsConfiguration:
+            - ArtifactType: DEPENDENCY_JAR
+              MavenReference:
+                GroupId: org.apache.flink
+                ArtifactId: flink-sql-connector-kinesis_2.12
+                Version: 1.13.2
+  AnalyticsServiceExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - InputStream
+      - OutputStream
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kinesisanalytics.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: glue-permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetConnection
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetDatabases
+                  - glue:GetUserDefinedFunction
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:connection/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}/*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                Resource:
+                  - "*"
+        - PolicyName: kinesis-permissions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:RegisterStreamConsumer
+                Resource:
+                  - !GetAtt InputStream.Arn
+                  - !GetAtt OutputStream.Arn
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                Resource:
+                  - "*"
+  
+  ## Kinesis Data Firehose
+  FirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - S3Logs
+      - FirehoseServiceExecutionRole
+      - GlueDatabase
+      - GlueTable
+    Properties: 
+      DeliveryStreamName: !Ref KinesisFirehoseName
+      DeliveryStreamType: KinesisStreamAsSource
+      ExtendedS3DestinationConfiguration: 
+        BucketARN: !GetAtt S3Logs.Arn
+        CompressionFormat: UNCOMPRESSED
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration: 
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe: {}
+          SchemaConfiguration:
+            CatalogId: !Ref AWS::AccountId
+            RoleARN: !GetAtt FirehoseServiceExecutionRole.Arn
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref GlueTableName
+            Region: !Ref AWS::Region
+            VersionId: LATEST
+        Prefix: stream/
+        RoleARN: !GetAtt FirehoseServiceExecutionRole.Arn
+      KinesisStreamSourceConfiguration: 
+        KinesisStreamARN: !GetAtt OutputStream.Arn
+        RoleARN: !GetAtt FirehoseServiceExecutionRole.Arn
+  FirehoseServiceExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - S3Logs
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Path: "/"
+      Policies:
+        - PolicyName: firehose-delivery-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref S3Logs
+                  - !Join 
+                    - ''
+                    - - 'arn:aws:s3:::'
+                      - !Ref S3Logs
+                      - '/*'
+              - Effect: Allow
+                Action: 'glue:GetTableVersions'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:GetShardIterator'
+                  - 'kinesis:GetRecords'
+                  - 'kinesis:ListShards'
+                Resource:
+                  - !Join
+                    - ''
+                    - - 'arn:aws:kinesis:'
+                      - !Ref AWS::Region
+                      - ':'
+                      - !Ref AWS::AccountId
+                      - ':stream/'
+                      - !Ref KinesisCuratedStreamName
+
+  ## S3 bucket
+  S3Logs:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+
+  ## Glue database 
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: 
+        Name: !Ref GlueDatabaseName
+  GlueTable:
+    Type: AWS::Glue::Table
+    DependsOn:
+      - GlueDatabase
+      - S3Logs
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput: 
+        Name: !Ref GlueTableName 
+        StorageDescriptor:
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Columns:
+          - Name: message
+            Type: string
+          - Name: tag
+            Type: string
+          - Name: timestamp
+            Type: string			
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          Location: !Sub 's3://${S3Logs}/stream'
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Parameters:
+            {'serialization.format': '1'}
+        TableType: EXTERNAL_TABLE
+
+  ## Athena 
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties: 
+      Name: !Ref AthenaWorkgroupName
+      State: ENABLED
